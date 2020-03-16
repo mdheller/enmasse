@@ -8,6 +8,7 @@ import static io.enmasse.systemtest.scale.metrics.MetricsAssertions.isPresent;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -15,6 +16,7 @@ import java.util.Queue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Predicate;
 import java.util.function.Supplier;
 
 import org.hawkular.agent.prometheus.types.Counter;
@@ -27,6 +29,7 @@ import io.enmasse.systemtest.logs.CustomLogger;
 import io.enmasse.systemtest.model.address.AddressType;
 import io.enmasse.systemtest.platform.Kubernetes;
 import io.enmasse.systemtest.platform.apps.SystemtestsKubernetesApps;
+import io.enmasse.systemtest.scale.metrics.DowntimeMonitoringResult;
 import io.enmasse.systemtest.scale.metrics.MessagingClientMetricsClient;
 import io.enmasse.systemtest.scale.metrics.MetricsMonitoringResult;
 import io.enmasse.systemtest.utils.TestUtils;
@@ -50,7 +53,8 @@ public class ScalePerformanceTestManager {
     private int totalExpectedConnections = 0;
     private final Map<String, ScaleTestClient<MessagingClientMetricsClient>> clientsMap = new ConcurrentHashMap<>();
     private final Queue<String> clientsMonitoringQueue = new ConcurrentLinkedQueue<>();
-    private final AtomicReference<MetricsMonitoringResult> monitoringResult = new AtomicReference<MetricsMonitoringResult>(new MetricsMonitoringResult());
+    private final AtomicReference<MetricsMonitoringResult> monitoringResult = new AtomicReference<>(new MetricsMonitoringResult());
+    private final DowntimeMonitoringResult downtimeResult = new DowntimeMonitoringResult();
 
     public ScalePerformanceTestManager(Endpoint addressSpaceEndpoint, UserCredentials credentials) {
         this.clientProvider = () -> {
@@ -76,7 +80,10 @@ public class ScalePerformanceTestManager {
         return monitoringResult;
     }
 
-    //probably can be deleted
+    public DowntimeMonitoringResult getDowntimeResult() {
+        return downtimeResult;
+    }
+
     public void deployMessagingClient(List<Address> addresses, AddressType type, int linksPerConnection) throws Exception {
         if (addresses == null || addresses.isEmpty()) {
             throw new IllegalArgumentException("Addresses cannot be null or empty");
@@ -142,7 +149,8 @@ public class ScalePerformanceTestManager {
                         ScaleTestClient<MessagingClientMetricsClient> client = clientsMap.get(clientId);
                         MessagingClientMetricsClient metricsClient = client.getMetricsClient();
 
-                        waitUntilHasValue(() -> metricsClient.getAcceptedDeliveries(client.getAddressesType()), "Client is not reporting accepted deliveries");
+                        waitUntilHasValue(() -> metricsClient.getAcceptedDeliveries(client.getAddressesType()), c -> c.getValue() >= 0,
+                                "Client is not reporting accepted deliveries");
 
                         int totalMadeConnections = (int) (metricsClient.getReconnects().getValue() + client.getConnections());
 
@@ -189,10 +197,56 @@ public class ScalePerformanceTestManager {
         }
     }
 
-    private void waitUntilHasValue(Supplier<Optional<Counter>> counterSupplier, String timeoutMessage) {
+    public Duration measureClientsDowntime() {
+        List<Double> averages = new ArrayList<>();
+        for (var client : clientsMap.values()) {
+
+            TestUtils.waitUntilCondition(() -> {
+                var optional = client.getMetricsClient().getReconnectDurationHistogram();
+                return optional.isPresent() && optional.get().getSampleCount() > 0;
+            }, Duration.ofSeconds(25), Duration.ofSeconds(5), () -> {
+                logger.info("Client {} not reporting reconnections maybe it's ok because of router still running");
+            });
+
+//          var histogram = client.getMetricsClient().getReconnectDurationHistogram().get();
+//          logger.info("sample count {}", histogram.getSampleCount());
+//          logger.info("sample sum {}", histogram.getSampleSum());
+//          histogram.getBuckets().forEach(b -> {
+//              logger.info(b.toString());
+//          });
+
+            var optional = client.getMetricsClient().getReconnectDurationHistogram();
+            if (optional.isPresent()) {
+                var histogram = optional.get();
+                double average = histogram.getSampleSum() / histogram.getSampleCount();
+                averages.add(average);
+            }
+
+        }
+
+        double sum = 0;
+        for (var a : averages) {
+            sum += a;
+        }
+        double average = sum / averages.size();
+        return Duration.ofSeconds((long) average);
+    }
+
+    public void sleep() throws InterruptedException {
+        long sleepMs = 4 * getConnections();
+
+        logger.info("#######################################");
+        logger.info("Created total {} connections with {} deployed clients, waiting {} s for system to react",
+                getConnections(), getClients(), sleepMs/1000);
+        logger.info("#######################################");
+
+        Thread.sleep(sleepMs);
+    }
+
+    private <T> void waitUntilHasValue(Supplier<Optional<T>> supplier, Predicate<T> predicate, String timeoutMessage) {
         TestUtils.waitUntilConditionOrFail(() -> {
-            var counter = counterSupplier.get();
-            return counter.isPresent() && counter.get().getValue() >= 0;
+            Optional<T> optional = supplier.get();
+            return optional.isPresent() && predicate.test(optional.get());
         }, Duration.ofSeconds(25), Duration.ofSeconds(5), () -> timeoutMessage);
     }
 
