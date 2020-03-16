@@ -98,9 +98,9 @@ class ScaleTest extends TestBase implements ITestBaseIsolated {
     private final int queueLinksPerConnIncrease = initialQueueLinksPerConn;
 
     //fault tolerance constants
-    private final int faultToleranceInitialAddresses = 10000;
+    private final int faultToleranceInitialAddresses = 8000;
     private final int faultToleranceAddressesPerGroup = 100;
-    private final int faultToleranceSendMessagesPeriod = 15000;
+    private final int faultToleranceSendMessagesPeriod = 20000;
 
     private final String namespace = "scale-test-namespace";
     private final String addressSpacePlanName = "test-addressspace-plan";
@@ -335,23 +335,20 @@ class ScaleTest extends TestBase implements ITestBaseIsolated {
             int runningPodsBefore = enmassePods.size();
 
             for (var pod : enmassePods) {
-                if (pod.getMetadata().getLabels().getOrDefault("capability", "").equals("router") ) {
+                kubernetes.deletePod(kubernetes.getInfraNamespace(), pod.getMetadata().getName());
+                Thread.sleep(5_000);
 
-                    kubernetes.deletePod(kubernetes.getInfraNamespace(), pod.getMetadata().getName());
-                    Thread.sleep(5_000);
+                DowntimeData data = new DowntimeData();
+                data.setName(pod.getMetadata().getName());
+                manager.getDowntimeResult().getDowntimeData().add(data);
+                //time to create address
+                var createTime = addAddressAndMeasure();
+                data.setCreateAddressTime(createTime.toSeconds()+"s");
+                //clients downtime
+                var downtimeTime = manager.measureClientsDowntime();
+                data.setReconnectTimeAverage(downtimeTime.toSeconds()+"s");
 
-                    DowntimeData data = new DowntimeData();
-                    data.setName(pod.getMetadata().getName());
-                    manager.getDowntimeResult().getDowntimeData().add(data);
-                    //time to create address
-                    var createTime = addAddressAndMeasure();
-                    data.setCreateAddressTime(createTime.toSeconds()+"s");
-                    //clients downtime
-                    var downtimeTime = manager.measureClientsDowntime();
-                    data.setReconnectTimeAverage(downtimeTime.toSeconds()+"s");
-
-                    TestUtils.waitForExpectedReadyPods(kubernetes, kubernetes.getInfraNamespace(), runningPodsBefore, new TimeoutBudget(10, TimeUnit.MINUTES));
-                }
+                TestUtils.waitForExpectedReadyPods(kubernetes, kubernetes.getInfraNamespace(), runningPodsBefore, new TimeoutBudget(10, TimeUnit.MINUTES));
             }
 
         } finally {
